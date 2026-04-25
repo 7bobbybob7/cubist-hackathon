@@ -117,6 +117,16 @@ def build_pod_prompt(
             )
         parts.append("")
 
+    allowed = frontmatter.get("allowed_tools") or []
+    if allowed:
+        parts.append(
+            "You have tools available (write_file, read_file, bash) for any "
+            "filesystem or shell work this task requires. Paths are sandboxed "
+            f"to the working directory. Use them as needed, then once the work "
+            f"is done emit your final {primary} JSON artifact as a single "
+            "text response (no prose around it, no code fences)."
+        )
+        parts.append("")
     parts.append(f"Produce one artifact of type {primary}.")
     parts.append("Output exactly this JSON shape (no prose, no code fences):")
     parts.append(schema_hint)

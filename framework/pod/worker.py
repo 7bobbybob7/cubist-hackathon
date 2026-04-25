@@ -21,12 +21,15 @@ import logging
 import time
 from typing import Any, Callable
 
-from framework.pod.anthropic_call import CallResult, call_messages
+from framework.pod.anthropic_call import (
+    CallResult, call_messages, call_messages_agentic,
+)
 from framework.pod.backend_client import BackendClient
 from framework.pod.prompt import (
     build_pod_prompt, contract_types, parse_artifact_content,
     primary_artifact_type,
 )
+from framework.pod.tools import build_tools
 
 log = logging.getLogger(__name__)
 
@@ -158,13 +161,31 @@ def process_one_task(
             input_artifacts=input_artifacts,
         )
         model = _resolve_model(task, frontmatter, config)
-        result = anthropic_caller(
-            model=model,
-            system=system,
-            user=user,
-            max_tokens=config["pod"]["max_tokens"],
-            pricing=config["pricing"],
+        tool_schemas, tool_handler = build_tools(
+            frontmatter, task.get("working_dir"),
         )
+        if tool_schemas and tool_handler is not None:
+            log.info(
+                "agentic call: %d tools available, working_dir=%s",
+                len(tool_schemas), task.get("working_dir"),
+            )
+            result = anthropic_caller(
+                model=model,
+                system=system,
+                user=user,
+                max_tokens=config["pod"]["max_tokens"],
+                pricing=config["pricing"],
+                tools=tool_schemas,
+                tool_handler=tool_handler,
+            )
+        else:
+            result = anthropic_caller(
+                model=model,
+                system=system,
+                user=user,
+                max_tokens=config["pod"]["max_tokens"],
+                pricing=config["pricing"],
+            )
     except Exception as e:
         log.exception("API call failed for %s", task_id)
         try:

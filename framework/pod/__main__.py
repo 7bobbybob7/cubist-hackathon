@@ -9,7 +9,9 @@ import sys
 import threading
 
 from framework.config import load_config
-from framework.pod.anthropic_call import build_anthropic_client, call_messages
+from framework.pod.anthropic_call import (
+    build_anthropic_client, call_messages, call_messages_agentic,
+)
 from framework.pod.backend_client import BackendClient
 from framework.pod.worker import pod_loop
 from framework.state import StatePaths
@@ -44,6 +46,8 @@ def main(argv: list[str] | None = None) -> int:
     anthropic_client = build_anthropic_client(api_key, max_retries=retries)
 
     def caller(**kwargs):
+        if "tools" in kwargs:
+            return call_messages_agentic(anthropic_client, **kwargs)
         return call_messages(anthropic_client, **kwargs)
 
     backend = BackendClient(base_url=args.backend_url)

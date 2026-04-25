@@ -67,8 +67,12 @@ class FakeAnthropic:
 
 
 def _caller_for(fake: FakeAnthropic):
-    from framework.pod.anthropic_call import call_messages
-    return lambda **kw: call_messages(fake, **kw)
+    from framework.pod.anthropic_call import call_messages, call_messages_agentic
+    def caller(**kw):
+        if "tools" in kw:
+            return call_messages_agentic(fake, **kw)
+        return call_messages(fake, **kw)
+    return caller
 
 
 # ---------------- pure prompt tests ----------------------------------
