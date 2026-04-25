@@ -134,6 +134,37 @@ def test_parse_artifact_content_falls_back_for_invalid_json():
     assert obj["raw_text"] == "not json at all"
 
 
+def test_parse_artifact_content_extracts_embedded_json_from_prose():
+    """Real bug from the FizzBuzz run: Haiku emits prose around the JSON."""
+    text = (
+        "Excellent! The implementation is complete.\n"
+        '{"files_changed": ["fizzbuzz.py"], "rationale": "did the thing", '
+        '"test_targets": ["python fizzbuzz.py"]}\n'
+        "All set."
+    )
+    obj = parse_artifact_content(text)
+    assert "_parse_error" not in obj
+    assert obj["files_changed"] == ["fizzbuzz.py"]
+    assert obj["rationale"] == "did the thing"
+
+
+def test_parse_artifact_content_handles_braces_inside_strings():
+    """Brace-balance walker must respect quoted strings so a `{` in a
+    rationale doesn't throw off the count."""
+    text = '{"rationale": "use a dict literal: {\\"a\\": 1}", "files_changed": []}'
+    obj = parse_artifact_content(text)
+    assert "_parse_error" not in obj
+    assert "dict literal" in obj["rationale"]
+    assert obj["files_changed"] == []
+
+
+def test_parse_artifact_content_picks_first_balanced_object():
+    """If the model accidentally emits two objects, we take the first."""
+    text = 'Result: {"a": 1} (also: {"b": 2})'
+    obj = parse_artifact_content(text)
+    assert obj == {"a": 1}
+
+
 def test_compute_cost_includes_cache_pricing():
     pricing = {"claude-haiku-4-5-20251001": {"input": 1.0, "output": 5.0}}
     usage = _FakeUsage(

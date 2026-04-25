@@ -25,8 +25,8 @@ from framework.bootstrap import bootstrap_run
 from framework.cli import commands as C
 from framework.cli._context import CliContext
 from framework.cli.subagent import (
-    PLANNING_INSTRUCTION, build_planning_prompt, parse_agent_md,
-    parse_planning_response,
+    PLANNING_INSTRUCTION, PlanContractViolation, build_planning_prompt,
+    parse_agent_md, parse_planning_response, validate_role_contracts,
 )
 from framework.pod.anthropic_call import CallResult
 from framework.pod.backend_client import BackendClient
@@ -144,6 +144,58 @@ def test_parse_planning_response_validates_roles():
         }))
 
 
+def test_validate_role_contracts_passes_clean_plan():
+    plan = {"tasks": [
+        {"agent_role": "development", "goal_text": "create file.py",
+         "output_artifact_types": ["PatchSummary"]},
+        {"agent_role": "testing", "goal_text": "run pytest",
+         "output_artifact_types": ["TestResult"]},
+    ]}
+    assert validate_role_contracts(plan) == []
+
+
+def test_validate_role_contracts_flags_testing_writing_files():
+    """The bug we hit on the live FizzBuzz run: methodology agent
+    assigned 'create test_fizzbuzz.py' to the testing role, which is
+    read-only by design."""
+    plan = {"tasks": [
+        {"agent_role": "testing", "goal_text": "Create test_fizzbuzz.py",
+         "output_artifact_types": ["TestResult"]},
+    ]}
+    issues = validate_role_contracts(plan)
+    assert len(issues) == 1
+    assert "testing" in issues[0] and "create" in issues[0].lower()
+
+
+def test_validate_role_contracts_flags_wrong_artifact_type():
+    plan = {"tasks": [
+        {"agent_role": "testing", "goal_text": "run pytest",
+         "output_artifact_types": ["PatchSummary"]},
+    ]}
+    issues = validate_role_contracts(plan)
+    assert any("cannot produce" in i for i in issues)
+
+
+def test_subagent_invoke_raises_on_contract_violation(bootstrapped_env, tmp_path):
+    """End-to-end: a plan that asks testing to write files should fail
+    closed at invoke-time, not at pod-claim time."""
+    from framework.cli.subagent import cmd_subagent_invoke
+
+    ctx, _, _, _, _ = bootstrapped_env
+    task_yaml = tmp_path / "task.yaml"
+    task_yaml.write_text(yaml.safe_dump({"goal": "x", "target_repo": "/tmp/r"}))
+    fake = FakeAnthropic(_planning_response([
+        {"agent_role": "testing", "goal_text": "Create test_x.py",
+         "output_artifact_types": ["TestResult"], "depends_on": [], "priority": 0,
+         "rationale": "..."},
+    ]))
+    with pytest.raises(PlanContractViolation):
+        cmd_subagent_invoke(
+            ctx, "methodology", str(task_yaml),
+            anthropic_caller=_caller_for(fake),
+        )
+
+
 def test_parse_planning_response_strips_code_fences():
     text = "```json\n{\"tasks\": [{\"agent_role\": \"development\", \"goal_text\": \"do\"}]}\n```"
     plan = parse_planning_response(text)
@@ -250,6 +302,14 @@ def test_subagent_invoke_writes_proposed_plan(bootstrapped_env, tmp_path):
     assert survey.depends_on == []
     assert parser.depends_on == [survey.task_id]
     assert tests.depends_on == [parser.task_id]
+
+    # working_dir defaults from the planning input's target_repo, so pods
+    # can sandbox tools to it. Methodology agents that don't emit
+    # working_dir explicitly should still get it filled in.
+    expected_wd = str(paths.root.parent / "repo")
+    assert survey.working_dir == expected_wd
+    assert parser.working_dir == expected_wd
+    assert tests.working_dir == expected_wd
 
     # parent_actions row recorded
     rows = db.query_all(

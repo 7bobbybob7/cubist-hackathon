@@ -69,8 +69,22 @@ PLANNING_INSTRUCTION = (
     "- ``depends_on`` lists the *positions* (0-indexed) of prior tasks in this "
     "same plan that must complete first. Resolve to task IDs after creation.\n"
     "- Prefer priority 0 unless one task should clearly run before its peers.\n"
-    "- output_artifact_types per role: methodology→[ResearchBrief], "
-    "development→[PatchSummary], testing→[TestResult].\n"
+    "\n"
+    "Role capabilities (HARD CONSTRAINTS — violations are rejected):\n"
+    "- methodology: read-only research and planning. Tools: filesystem_read, web_search. "
+    "Output: ResearchBrief. Cannot edit files. Cannot run shell commands.\n"
+    "- development: full filesystem write + bash. Output: PatchSummary. Use this "
+    "role for ANY task that creates, writes, edits, or generates a file — "
+    "including writing test files. The development role is the ONLY role that "
+    "can create files.\n"
+    "- testing: read-only file access + bash. Output: TestResult. Use ONLY for "
+    "running existing tests (e.g. `pytest`) and reporting results. Never assign "
+    "the testing role a goal that involves creating, writing, or editing files. "
+    "If a test file does not yet exist, plan a separate development task to "
+    "write it first.\n"
+    "\n"
+    "output_artifact_types must match the role's output: "
+    "methodology→[ResearchBrief], development→[PatchSummary], testing→[TestResult].\n"
 )
 
 
@@ -116,6 +130,58 @@ _VALID_ARTIFACT_TYPES = (
     "FailureReport", "ProgressLogEntry",
 )
 
+# Each role's allowed primary output types. ProgressLogEntry is synthesized
+# by the framework so it's not in this list; FailureReport is a fallback
+# any role can emit and is also excluded.
+_ROLE_PRIMARY_OUTPUTS = {
+    "methodology": {"ResearchBrief"},
+    "development": {"PatchSummary"},
+    "testing":     {"TestResult"},
+}
+
+# Words that suggest a task is asking the role to write/create a file.
+# Used to flag testing-role tasks that violate read-only.
+_WRITE_VERBS = re.compile(
+    r"\b(create|write|add|generate|implement|edit|modify|patch|"
+    r"insert|append|delete|remove|refactor)\b",
+    re.IGNORECASE,
+)
+
+
+def validate_role_contracts(plan: dict[str, Any]) -> list[str]:
+    """Return a list of human-readable contract violations in ``plan['tasks']``.
+
+    Empty list means the plan is internally consistent. Caller decides
+    whether to raise or just warn.
+    """
+    issues: list[str] = []
+    for i, t in enumerate(plan.get("tasks", []) or []):
+        role = t.get("agent_role")
+        out_types = list(t.get("output_artifact_types") or [])
+        goal = (t.get("goal_text") or "").strip()
+
+        allowed = _ROLE_PRIMARY_OUTPUTS.get(role, set())
+        for at in out_types:
+            if at in ("ProgressLogEntry", "FailureReport"):
+                continue
+            if at not in allowed:
+                issues.append(
+                    f"task[{i}] role={role!r} cannot produce {at!r} "
+                    f"(allowed: {sorted(allowed) or 'none'})"
+                )
+        if role == "testing" and _WRITE_VERBS.search(goal):
+            issues.append(
+                f"task[{i}] role='testing' goal contains write-verb "
+                f"({_WRITE_VERBS.search(goal).group(0)!r}); "
+                "the testing role is read-only — split off a "
+                "development task to do the writing"
+            )
+    return issues
+
+
+class PlanContractViolation(ValueError):
+    """Raised when the methodology agent emits a plan that violates role contracts."""
+
 
 def parse_planning_response(text: str) -> dict[str, Any]:
     """Parse the JSON the model returned. Tolerates code fences."""
@@ -148,12 +214,18 @@ def parse_planning_response(text: str) -> dict[str, Any]:
     return plan
 
 
-def _strip_to_taskspec(t: dict[str, Any], idx: int) -> dict[str, Any]:
+def _strip_to_taskspec(
+    t: dict[str, Any], idx: int, *, default_working_dir: str | None = None,
+) -> dict[str, Any]:
     """Drop fields ``framework plan create`` doesn't accept (rationale, etc.)
     and validate positional depends_on (forward refs / self-refs are dropped).
 
     Positional ``depends_on`` (integers) are preserved as-is for
     ``cmd_plan_create`` to resolve into real task IDs at create time.
+
+    ``working_dir`` defaults to ``default_working_dir`` (the planning
+    invocation's ``target_repo``) when the model doesn't supply one. Pods
+    need this set or they can't expose filesystem/bash tools to the role.
     """
     deps_raw = t.get("depends_on", []) or []
     deps_clean: list = []
@@ -171,6 +243,7 @@ def _strip_to_taskspec(t: dict[str, Any], idx: int) -> dict[str, Any]:
         "output_artifact_types": t.get("output_artifact_types") or [],
         "depends_on": deps_clean,
         "priority": int(t.get("priority", 0)),
+        "working_dir": t.get("working_dir") or default_working_dir,
     }
 
 
@@ -258,12 +331,22 @@ def cmd_subagent_invoke(
 
     plan = parse_planning_response(result.text)
 
+    issues = validate_role_contracts(plan)
+    if issues:
+        raise PlanContractViolation(
+            "methodology agent produced a plan that violates role contracts:\n  - "
+            + "\n  - ".join(issues)
+            + "\n\nRe-invoke the methodology agent or hand-edit the plan."
+        )
+
     # Write the proposed plan to plan/proposed_<ts>.yaml in a shape
     # `framework plan create` accepts directly. We synthesize positional
     # placeholder IDs ("__t0", "__t1", ...) only for depends_on resolution
     # at create time; the actual IDs are assigned by the backend.
+    target_repo = task.get("target_repo")
     cleaned_tasks = [
-        _strip_to_taskspec(t, i) for i, t in enumerate(plan["tasks"])
+        _strip_to_taskspec(t, i, default_working_dir=target_repo)
+        for i, t in enumerate(plan["tasks"])
     ]
 
     plan_dir = ctx.paths.plan_dir

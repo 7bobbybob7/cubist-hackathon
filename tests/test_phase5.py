@@ -324,7 +324,7 @@ def test_small_project_end_to_end(env):
             },
             {
                 "agent_role": "testing",
-                "goal_text": "Add unit tests for greet()",
+                "goal_text": "Run unit tests for greet() and report results",
                 "recommended_model": "claude-haiku-4-5-20251001",
                 "output_artifact_types": ["TestResult"],
                 "depends_on": [0], "priority": 3,

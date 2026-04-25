@@ -161,9 +161,49 @@ def build_hardcoded_prompt(task: dict[str, Any]) -> tuple[str, str]:
 build_prompt = build_hardcoded_prompt
 
 
+def _extract_balanced_json(text: str) -> str | None:
+    """Find the first balanced ``{ ... }`` substring and return it.
+
+    Walks the string with a brace counter that respects double-quoted
+    strings (and their backslash escapes) so a ``{`` inside a string
+    doesn't throw off the count. Returns ``None`` if no top-level
+    object is found.
+    """
+    start = -1
+    depth = 0
+    in_str = False
+    esc = False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    return text[start:i + 1]
+    return None
+
+
 def parse_artifact_content(text: str) -> Any:
-    """Parse the model's reply as JSON; on failure, wrap raw text so the
-    user can still see what came back at the after gate.
+    """Parse the model's reply as JSON; tolerate code fences and prose.
+
+    Models sometimes emit prose around the JSON ("Here you go:\\n{...}\\n
+    Done!"). We try strict JSON first (after fence stripping); on failure
+    we extract the first balanced top-level object and try that. Only if
+    both fail do we wrap the raw text so the user can see what came back.
     """
     text = text.strip()
     if text.startswith("```"):
@@ -176,4 +216,11 @@ def parse_artifact_content(text: str) -> Any:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"raw_text": text, "_parse_error": True}
+        pass
+    embedded = _extract_balanced_json(text)
+    if embedded is not None:
+        try:
+            return json.loads(embedded)
+        except json.JSONDecodeError:
+            pass
+    return {"raw_text": text, "_parse_error": True}
