@@ -35,6 +35,10 @@ EVENT_TYPES = frozenset({
     "worktree_created",
     "worktree_shared",
     "worktree_removed",
+    # v3 — experimental loop / candidate variants
+    "candidate_set_created",
+    "candidate_promoted",
+    "candidate_set_abandoned",
 })
 
 _jsonl_lock = threading.Lock()

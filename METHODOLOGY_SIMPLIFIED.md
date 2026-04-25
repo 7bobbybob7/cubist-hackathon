@@ -574,14 +574,80 @@ Build in this order. Do not skip ahead. Each phase ends with a working, testable
 - `framework session reset` mechanism for long runs
 - Resilience tests: kill pod mid-task, hit budget cap, reject a task at both gates
 
-### Phase 7 (deferred to v2)
+### Phase 7 (shipped in v2)
 - Second pod (`POD_B`) with concurrent claiming
-- Experimental loop: candidates, eval results, promote/prune
 - Git worktrees for parallel candidate development
+
+### Phase 8 (shipped in v3 — see Section 19a)
+- Experimental loop: candidates, manual promote/abandon
+
+### Still deferred (v4+)
+- Auto-eval / scoring of candidates (currently human-pick only)
 - Cross-run memory
 - Soft gates with timers
 - Migrate framework tools from bash to MCP server
 - Optional read-only web UI
+
+---
+
+## 19a. Candidate Variants (v3)
+
+A **candidate set** is N tasks attempting the same logical goal with one varied dimension (model, prompt, ordering). The user opts in by running `framework plan candidates <yaml>` instead of the linear `plan create`. The framework spawns one phantom-parent row plus N children; children flow through the normal gate machinery in parallel; the user picks ONE winner whose changes merge into base, and the losers are pruned.
+
+This is opt-in — the linear flow remains the default. Candidates earn their N× cost only when the user genuinely doesn't know which approach is right.
+
+### Storage: phantom parent row
+
+The set is itself a row in `tasks` with `task_id` prefixed `c_<id>` (vs `t_<id>` for normal tasks), `agent_role='candidate_set'`, and `status='done'` so it never appears in any active queue. Children point at it via the existing `parent_task_id` FK. No new column added — the prefix discriminates phantoms from regular tasks at every read site.
+
+### Lifecycle
+
+```
+plan candidates <yaml>            (phantom + N children, all at before_gate)
+  ↓
+gate before approve t_a t_b ...   (existing batch path; N worktrees forked from base)
+  ↓
+N pods race in their own worktrees
+  ↓
+all children → after_gate         (after-gate of a candidate child SUPPRESSES the
+                                   merge-into-base that normal dev tasks do; the
+                                   per-task branch is preserved for review)
+  ↓
+candidate review c_xxx             (parent surfaces N artifacts side-by-side)
+  ↓
+candidate promote c_xxx t_winner   (winner's branch merges; losers' worktrees +
+                                    branches deleted; phantom archived)
+   OR
+candidate abandon c_xxx --reason   (no merge; all children → 'abandoned';
+                                    all worktrees + branches deleted)
+```
+
+### Hard rules
+
+- `framework gate after approve` on a candidate child raises `IllegalTransition`. The user must use `candidate promote` or `candidate abandon` to resolve the set. Without this guard, the user could approve all N children and end up with no merge ever performed.
+- The merge-into-base that normally fires at after-gate approve (Section 15-equivalent for v2 worktrees) is suppressed for candidate children. Merge happens exclusively at promote time, and only for the winner.
+- Auto-commit of the per-task worktree fires at `submit_result` for candidate children (so the per-task branch reflects the model's work even though after-gate approve never runs for them). This means the review UI sees a real diff for each candidate.
+- Promote refuses if any sibling is still mid-flight (`claimed`/`running`/etc.) — the user must see the whole set before picking.
+
+### Allowed variations
+
+In v3, variants may differ on `recommended_model`, `goal_text` (prompt extras), `variant_label` (free-form short identifier surfaced in review), and `agent_role` (uncommon — usually all candidates share one role). They MUST share `output_artifact_types` and `depends_on` so the comparison is fair.
+
+### Cost model
+
+A set of N candidates costs N × (single task budget). For an Opus-heavy goal that takes ~20¢ on Opus, three Opus candidates run ~60¢. The parent's `CLAUDE.md` instructs it to cost-warn before spawning. The daily budget cap (Section 15) still applies across candidates — if the cap fires mid-set, remaining children stay in `before_gate` (the user can resume the next day or `candidate abandon`).
+
+### Concurrency
+
+Promote requires merging the winner's branch into base via the existing temp-worktree merge (`framework/worktree.py:merge_into_base`). Parallel after-gate approvals across two SETS could race on the merge — but in practice gates are user-driven and serial. A future `flock` on the merge step would harden this; deferred until needed.
+
+### Out of scope for v3
+
+- Auto-evaluation / scoring (the human picks)
+- Methodology-agent-emitted candidate plans (the user invokes `plan candidates` manually)
+- More than 16 variants per set (refused by the service for spend safety)
+
+See `framework/services.py` for `create_candidate_set`, `promote_candidate`, `abandon_candidate_set`. CLI surface in `framework/cli/parser.py` and `commands.py`. Tests in `tests/test_candidates.py`.
 
 ---
 
@@ -593,7 +659,6 @@ Do not build these in v1.
 - Streamlit / web UI
 - Soft gates / countdown timers
 - Cross-run memory
-- Experimental loop with candidate variants
 - Multiple development pods working concurrently on the same repo
 - WebSocket live updates
 - Distributed deployment

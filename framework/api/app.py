@@ -43,6 +43,17 @@ class DBQueryIn(BaseModel):
     params: list[Any] = []
 
 
+class CandidateSetIn(BaseModel):
+    """Body for ``POST /candidate-sets``."""
+    goal_text: str
+    variants: list[TaskCreate]
+    shared_role: str = "development"
+
+
+class CandidateAbandonIn(BaseModel):
+    reason: str = "abandoned by user"
+
+
 def create_app(state_dir: str | Path) -> FastAPI:
     paths = StatePaths(state_dir)
     paths.ensure()
@@ -76,6 +87,10 @@ def create_app(state_dir: str | Path) -> FastAPI:
     @app.exception_handler(svc.IllegalTransition)
     async def _illegal(_req, exc):
         return JSONResponse(status_code=409, content={"detail": str(exc)})
+
+    @app.exception_handler(ValueError)
+    async def _bad_request(_req, exc):
+        return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     # ---------------- Tasks ------------------------------------------
 
@@ -151,6 +166,53 @@ def create_app(state_dir: str | Path) -> FastAPI:
         return svc.reject_after(
             db, paths.events_jsonl, task_id, body.reason, state_paths=paths,
         )
+
+    # ---------------- Candidate sets (v3) ---------------------------
+
+    @app.post("/candidate-sets")
+    def create_candidate_set(
+        body: CandidateSetIn,
+        db: Database = Depends(get_db),
+        paths: StatePaths = Depends(get_paths),
+    ):
+        return svc.create_candidate_set(
+            db, paths.events_jsonl,
+            goal_text=body.goal_text,
+            variants=body.variants,
+            shared_role=body.shared_role,
+        )
+
+    @app.post("/candidate-sets/{set_id}/promote/{winner_task_id}",
+              response_model=TaskOut)
+    def candidate_promote(
+        set_id: str,
+        winner_task_id: str,
+        db: Database = Depends(get_db),
+        paths: StatePaths = Depends(get_paths),
+    ):
+        return svc.promote_candidate(
+            db, paths.events_jsonl, paths,
+            set_id=set_id, winner_task_id=winner_task_id,
+        )
+
+    @app.post("/candidate-sets/{set_id}/abandon")
+    def candidate_abandon(
+        set_id: str,
+        body: CandidateAbandonIn,
+        db: Database = Depends(get_db),
+        paths: StatePaths = Depends(get_paths),
+    ):
+        return svc.abandon_candidate_set(
+            db, paths.events_jsonl, paths,
+            set_id=set_id, reason=body.reason,
+        )
+
+    @app.get("/candidate-sets/{set_id}")
+    def candidate_get(
+        set_id: str,
+        db: Database = Depends(get_db),
+    ):
+        return svc.get_candidate_set(db, set_id)
 
     # ---------------- Pod operations --------------------------------
 

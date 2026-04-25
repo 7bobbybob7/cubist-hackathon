@@ -40,6 +40,19 @@ def _new_task_id() -> str:
         return f"t_{uuid.uuid4().hex[:10]}"
 
 
+def _new_candidate_set_id() -> str:
+    """``c_*`` IDs are reserved for phantom-parent rows of candidate sets.
+
+    Children point at the phantom via ``parent_task_id``; the existing
+    FK on tasks.parent_task_id then transitively tracks the set.
+    """
+    return f"c_{uuid.uuid4().hex[:10]}"
+
+
+def is_candidate_set_id(task_id: str | None) -> bool:
+    return bool(task_id) and task_id.startswith("c_")
+
+
 def _new_artifact_id(artifact_type: str) -> str:
     global _artifact_counter
     with _id_lock:
@@ -239,8 +252,9 @@ def create_task(
         INSERT INTO tasks (
             task_id, parent_task_id, agent_role, goal_text,
             input_artifact_ids, output_artifact_types, recommended_model,
-            priority, created_at, depends_on, working_dir, status
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            priority, created_at, depends_on, working_dir, status,
+            variant_label
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             task_id,
@@ -255,6 +269,7 @@ def create_task(
             json.dumps(spec.depends_on),
             spec.working_dir,
             initial_status,
+            spec.variant_label,
         ),
     )
     emit_event(
@@ -267,6 +282,302 @@ def create_task(
             db, events_jsonl, "task_before_gate", task_id=task_id, payload={},
         )
     return get_task(db, task_id)
+
+
+def create_candidate_set(
+    db: Database,
+    events_jsonl: Path,
+    *,
+    goal_text: str,
+    variants: list[TaskCreate],
+    shared_role: str = "development",
+) -> dict[str, Any]:
+    """Create a candidate set: one phantom-parent row + N children.
+
+    The phantom row's ``task_id`` starts with ``c_`` and has
+    ``agent_role='candidate_set'`` so the regular claim/dispatch path
+    skips it (no role-specific tooling, no worktree). Each child
+    inherits the shared goal but can override ``recommended_model``,
+    ``goal_text`` (for prompt-extras), ``variant_label``, etc., per
+    Step 2 of the v3 plan.
+
+    Children are inserted at ``before_gate`` so the user can review/edit
+    each one before approving (typically via the existing batch
+    ``framework gate before approve t_a t_b ...``).
+
+    Returns ``{"set_id": ..., "task_ids": [...]}``.
+    """
+    if not variants:
+        raise ValueError("at least one variant is required")
+    if len(variants) > 16:
+        raise ValueError(
+            f"refusing to create {len(variants)} candidates — max 16 per set "
+            "(spend safety; raise if you really need it)"
+        )
+
+    set_id = _new_candidate_set_id()
+    now = utcnow_iso()
+
+    # Phantom parent row — represents the set itself. status='done' so it
+    # never sits in any active queue; archived_at gets set when the set
+    # resolves (promote/abandon).
+    db.execute(
+        """
+        INSERT INTO tasks (
+            task_id, parent_task_id, agent_role, goal_text,
+            input_artifact_ids, output_artifact_types, recommended_model,
+            priority, created_at, depends_on, working_dir, status
+        ) VALUES (?,NULL,'candidate_set',?,'[]','[]',NULL,0,?,'[]',NULL,'done')
+        """,
+        (set_id, goal_text, now),
+    )
+
+    child_ids: list[str] = []
+    for v in variants:
+        child = TaskCreate(
+            **{**v.model_dump(),
+               "parent_task_id": set_id,
+               "agent_role": v.agent_role or shared_role,
+               "goal_text": v.goal_text or goal_text}
+        )
+        t = create_task(db, events_jsonl, child)
+        child_ids.append(t.task_id)
+
+    emit_event(
+        db, events_jsonl, "candidate_set_created",
+        task_id=set_id,
+        payload={"goal": goal_text, "child_ids": child_ids,
+                 "count": len(child_ids)},
+    )
+    return {"set_id": set_id, "task_ids": child_ids}
+
+
+def get_candidate_set(db: Database, set_id: str) -> dict[str, Any]:
+    """Return the phantom-parent row + all children for a candidate set."""
+    if not is_candidate_set_id(set_id):
+        raise ValueError(f"{set_id!r} is not a candidate-set ID (must start with 'c_')")
+    phantom_row = db.query_one("SELECT * FROM tasks WHERE task_id = ?", (set_id,))
+    if phantom_row is None:
+        raise TaskNotFound(set_id)
+    children = db.query_all(
+        "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at ASC",
+        (set_id,),
+    )
+    return {
+        "set_id": set_id,
+        "goal_text": phantom_row["goal_text"],
+        "archived_at": phantom_row["archived_at"],
+        "children": [TaskOut.from_row(c).model_dump() for c in children],
+    }
+
+
+def promote_candidate(
+    db: Database,
+    events_jsonl: Path,
+    state_paths: StatePaths,
+    *,
+    set_id: str,
+    winner_task_id: str,
+) -> TaskOut:
+    """Promote one candidate as the winner of a set.
+
+    Lifecycle:
+      1. Validate: set_id is c_*, winner is a child, all siblings have
+         resolved (after_gate / done / abandoned / rejected).
+      2. Winner: merge its per-task branch into base (the merge that
+         was suppressed at after-gate now happens), set status='done',
+         attach diff to PatchSummary, remove its worktree+branch.
+      3. Each loser still in after_gate → status='abandoned',
+         worktree+branch removed.
+      4. Phantom parent → archived_at = now (drops out of active queue).
+      5. Emit ``candidate_promoted`` event.
+    """
+    if not is_candidate_set_id(set_id):
+        raise ValueError(f"{set_id!r} is not a candidate-set ID")
+    set_row = db.query_one("SELECT * FROM tasks WHERE task_id = ?", (set_id,))
+    if set_row is None:
+        raise TaskNotFound(set_id)
+    if set_row["agent_role"] != "candidate_set":
+        raise ValueError(f"{set_id!r} is not a candidate set")
+
+    children = db.query_all(
+        "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY created_at",
+        (set_id,),
+    )
+    if not children:
+        raise ValueError(f"candidate set {set_id} has no children")
+    children_by_id = {c["task_id"]: c for c in children}
+    if winner_task_id not in children_by_id:
+        raise ValueError(
+            f"task {winner_task_id} is not a child of candidate set {set_id}"
+        )
+    winner = children_by_id[winner_task_id]
+    if winner["status"] not in ("after_gate", "done"):
+        raise IllegalTransition(
+            f"winner {winner_task_id} is in {winner['status']!r}; "
+            "expected 'after_gate' or 'done'"
+        )
+
+    # Refuse to promote while siblings are still running — the user
+    # should review all candidates before picking. (We don't refuse if
+    # a sibling is in 'rejected' — those are user-resolved already.)
+    unresolved = [
+        c["task_id"] for c in children
+        if c["task_id"] != winner_task_id
+        and c["status"] in ("created", "before_gate", "ready",
+                             "claimed", "running")
+    ]
+    if unresolved:
+        raise IllegalTransition(
+            f"candidate set {set_id} has {len(unresolved)} unresolved "
+            f"siblings: {unresolved!r}; wait for after_gate or abandon"
+        )
+
+    meta = _load_run_meta(state_paths)
+    target_repo = meta.get("target_repo") if meta else None
+    base_branch = meta.get("branch_name") if meta else None
+    target_is_git = bool(meta and meta.get("target_is_git"))
+    now = utcnow_iso()
+
+    # --- winner: merge + diff capture + cleanup ----------------------
+    diff_text: str | None = None
+    if target_is_git and target_repo and base_branch and winner["worktree_path"]:
+        from framework.worktree import (
+            auto_commit_all, delete_branch, extract_diff,
+            merge_into_base, remove_worktree,
+        )
+        # Auto-commit was already done at after-gate (Step 3 keeps that
+        # path live for candidates), but be defensive — re-running it
+        # is a no-op when there's nothing to commit.
+        auto_commit_all(
+            winner["worktree_path"],
+            f"[{winner_task_id}] auto-commit on candidate promote",
+        )
+        diff_text = extract_diff(winner["worktree_path"], base_branch) or None
+        winner_branch = f"{base_branch}-{winner_task_id}"
+        try:
+            merge_into_base(target_repo, base_branch, winner_branch)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "merge of winner %s failed: %s — branch left dangling",
+                winner_task_id, e,
+            )
+        remove_worktree(target_repo, winner["worktree_path"])
+        delete_branch(target_repo, winner_branch)
+        if diff_text:
+            _attach_diff_to_patch_summary(db, winner_task_id, diff_text)
+
+    db.execute(
+        "UPDATE tasks SET status = 'done', worktree_path = NULL "
+        "WHERE task_id = ?",
+        (winner_task_id,),
+    )
+    emit_event(db, events_jsonl, "task_approved_after",
+               task_id=winner_task_id)
+
+    # --- losers: abandon + cleanup -----------------------------------
+    loser_ids: list[str] = []
+    for c in children:
+        if c["task_id"] == winner_task_id:
+            continue
+        if c["status"] == "rejected":
+            # Already user-resolved — leave as-is.
+            continue
+        loser_ids.append(c["task_id"])
+        if (target_is_git and target_repo and base_branch
+                and c["worktree_path"]):
+            from framework.worktree import delete_branch, remove_worktree
+            remove_worktree(target_repo, c["worktree_path"])
+            delete_branch(target_repo, f"{base_branch}-{c['task_id']}")
+        db.execute(
+            "UPDATE tasks SET status = 'abandoned', worktree_path = NULL, "
+            "rejection_reason = ? WHERE task_id = ?",
+            (f"lost to candidate {winner_task_id}", c["task_id"]),
+        )
+
+    # --- phantom: archive --------------------------------------------
+    db.execute(
+        "UPDATE tasks SET archived_at = ? WHERE task_id = ?",
+        (now, set_id),
+    )
+
+    emit_event(
+        db, events_jsonl, "candidate_promoted",
+        task_id=set_id,
+        payload={
+            "winner": winner_task_id,
+            "losers": loser_ids,
+            "had_diff": bool(diff_text),
+        },
+    )
+    return get_task(db, winner_task_id)
+
+
+def abandon_candidate_set(
+    db: Database,
+    events_jsonl: Path,
+    state_paths: StatePaths,
+    *,
+    set_id: str,
+    reason: str,
+) -> dict[str, Any]:
+    """Drop an entire candidate set without picking a winner.
+
+    All children → status='abandoned'. All worktrees + per-task branches
+    are removed. Phantom parent is archived. Used when the user reviews
+    the candidates and decides none are good enough — typically followed
+    by a fresh ``plan candidates`` (or methodology re-invocation) with a
+    sharpened spec.
+
+    Tasks already in ``done`` or ``rejected`` are left as-is — their
+    user-resolved state is more specific than ``abandoned`` and we
+    shouldn't squash it.
+    """
+    if not is_candidate_set_id(set_id):
+        raise ValueError(f"{set_id!r} is not a candidate-set ID")
+    set_row = db.query_one("SELECT * FROM tasks WHERE task_id = ?", (set_id,))
+    if set_row is None:
+        raise TaskNotFound(set_id)
+    if set_row["agent_role"] != "candidate_set":
+        raise ValueError(f"{set_id!r} is not a candidate set")
+
+    children = db.query_all(
+        "SELECT * FROM tasks WHERE parent_task_id = ?", (set_id,),
+    )
+
+    meta = _load_run_meta(state_paths)
+    target_repo = meta.get("target_repo") if meta else None
+    base_branch = meta.get("branch_name") if meta else None
+    target_is_git = bool(meta and meta.get("target_is_git"))
+
+    abandoned_ids: list[str] = []
+    full_reason = f"abandoned candidate set: {reason}"
+    for c in children:
+        if c["status"] in ("done", "rejected"):
+            continue
+        abandoned_ids.append(c["task_id"])
+        if (target_is_git and target_repo and base_branch
+                and c["worktree_path"]):
+            from framework.worktree import delete_branch, remove_worktree
+            remove_worktree(target_repo, c["worktree_path"])
+            delete_branch(target_repo, f"{base_branch}-{c['task_id']}")
+        db.execute(
+            "UPDATE tasks SET status = 'abandoned', worktree_path = NULL, "
+            "rejection_reason = ? WHERE task_id = ?",
+            (full_reason, c["task_id"]),
+        )
+
+    db.execute(
+        "UPDATE tasks SET archived_at = ? WHERE task_id = ?",
+        (utcnow_iso(), set_id),
+    )
+    emit_event(
+        db, events_jsonl, "candidate_set_abandoned",
+        task_id=set_id,
+        payload={"abandoned": abandoned_ids, "reason": reason},
+    )
+    return {"set_id": set_id, "abandoned": abandoned_ids, "reason": reason}
 
 
 def edit_task(
@@ -552,6 +863,27 @@ def submit_result(
             (now, task.pod_id),
         )
 
+    # v3: when a candidate child lands at after_gate, auto-commit its
+    # worktree right away so the per-task branch reflects the model's
+    # work. Otherwise the user reviews uncommitted edits and a later
+    # `candidate promote` finds nothing to merge. (For non-candidate
+    # tasks, the auto-commit at after-gate approve covers this — but
+    # candidate after-gate approve is forbidden, so we do it here.)
+    if (task.agent_role == "development"
+            and task.worktree_path
+            and is_candidate_set_id(task.parent_task_id)):
+        try:
+            from framework.worktree import auto_commit_all
+            auto_commit_all(
+                task.worktree_path,
+                f"[{task_id}] auto-commit on candidate submit",
+            )
+        except Exception:
+            import logging
+            logging.getLogger(__name__).exception(
+                "candidate auto-commit failed for %s", task_id,
+            )
+
     # Per-agent change log (Phase 5). Best-effort: a logging failure
     # must not invalidate the just-saved artifact + ledger row.
     if logs_dir is not None:
@@ -604,34 +936,45 @@ def _maybe_cleanup_worktree(
         from framework.worktree import (
             auto_commit_all, extract_diff, merge_into_base, remove_worktree,
         )
+        is_candidate_child = is_candidate_set_id(task.parent_task_id)
         if capture_diff and task.agent_role == "development":
             # Auto-commit any pod edits the model didn't commit itself,
-            # so the per-task branch reflects the work and the merge
-            # has something to fast-forward.
+            # so the per-task branch reflects the work and the diff has
+            # something concrete to capture. We do this for ALL dev
+            # after-gate approves, including candidate children — the
+            # review UI shows each candidate's diff.
             auto_commit_all(
                 task.worktree_path,
                 f"[{task.task_id}] auto-commit on after-gate approve",
             )
             diff_text = extract_diff(task.worktree_path, base_branch) or None
-            # Merge the per-task branch into base so downstream tasks
-            # (whose worktrees fork from base at before-gate approve)
-            # see the just-approved changes.
-            task_branch = f"{base_branch}-{task.task_id}"
-            try:
-                merge_into_base(target_repo, base_branch, task_branch)
-                emit_event(
-                    db, events_jsonl, "plan_revised",
-                    task_id=task.task_id,
-                    payload={"event": "merged_into_base",
-                             "branch": task_branch, "base": base_branch},
-                )
-            except Exception as merge_err:
-                import logging
-                logging.getLogger(__name__).warning(
-                    "merge into %s failed for %s: %s — branch left dangling",
-                    base_branch, task.task_id, merge_err,
-                )
-        remove_worktree(target_repo, task.worktree_path)
+            # Merge into base ONLY for regular dev tasks. Candidate
+            # children must NOT merge at after-gate — that decision is
+            # deferred to ``promote_candidate``, which picks one winner
+            # and merges only that one. Without this guard the first
+            # sibling's after-gate would race the others to base and
+            # the user's promote choice would be moot.
+            if not is_candidate_child:
+                task_branch = f"{base_branch}-{task.task_id}"
+                try:
+                    merge_into_base(target_repo, base_branch, task_branch)
+                    emit_event(
+                        db, events_jsonl, "plan_revised",
+                        task_id=task.task_id,
+                        payload={"event": "merged_into_base",
+                                 "branch": task_branch, "base": base_branch},
+                    )
+                except Exception as merge_err:
+                    import logging
+                    logging.getLogger(__name__).warning(
+                        "merge into %s failed for %s: %s — branch left dangling",
+                        base_branch, task.task_id, merge_err,
+                    )
+        # Worktree removal: candidate children KEEP their worktree past
+        # after-gate so the user can browse each candidate's files in
+        # the review UI. The worktree is removed at promote/abandon.
+        if not is_candidate_child:
+            remove_worktree(target_repo, task.worktree_path)
     except Exception:
         import logging
         logging.getLogger(__name__).exception(
@@ -639,15 +982,16 @@ def _maybe_cleanup_worktree(
         )
         return diff_text
 
-    db.execute(
-        "UPDATE tasks SET worktree_path = NULL WHERE task_id = ?",
-        (task.task_id,),
-    )
-    emit_event(
-        db, events_jsonl, "worktree_removed",
-        task_id=task.task_id,
-        payload={"had_diff": bool(diff_text)},
-    )
+    if not is_candidate_set_id(task.parent_task_id):
+        db.execute(
+            "UPDATE tasks SET worktree_path = NULL WHERE task_id = ?",
+            (task.task_id,),
+        )
+        emit_event(
+            db, events_jsonl, "worktree_removed",
+            task_id=task.task_id,
+            payload={"had_diff": bool(diff_text)},
+        )
     return diff_text
 
 
@@ -686,6 +1030,15 @@ def approve_after(
     if task.status != "after_gate":
         raise IllegalTransition(
             f"task {task_id} is in {task.status!r}; expected 'after_gate'"
+        )
+    # Candidate children resolve via promote/abandon, not approve_after.
+    # Otherwise the user could approve all siblings to 'done', and we'd
+    # have N "winners" with no merge ever performed.
+    if is_candidate_set_id(task.parent_task_id):
+        raise IllegalTransition(
+            f"task {task_id} is a candidate child of {task.parent_task_id}; "
+            "use `framework candidate promote` (or `abandon`) to resolve "
+            "the set, not `gate after approve`"
         )
     db.execute("UPDATE tasks SET status = 'done' WHERE task_id = ?", (task_id,))
     emit_event(db, events_jsonl, "task_approved_after", task_id=task_id)

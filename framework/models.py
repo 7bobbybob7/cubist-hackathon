@@ -31,6 +31,11 @@ class TaskCreate(BaseModel):
     priority: int = 0
     depends_on: list[str] = Field(default_factory=list)
     working_dir: str | None = None
+    # v3 — candidate variants. Free-form short label ("opus", "concise",
+    # "seed=42") that surfaces in candidate review. Not stored in the
+    # tasks table directly — folded into goal_text by the service layer
+    # so the model sees what makes this candidate distinct. Optional.
+    variant_label: str | None = None
 
 
 class TaskEdit(BaseModel):
@@ -69,6 +74,7 @@ class TaskOut(BaseModel):
     retry_count: int
     archived_at: str | None = None
     worktree_path: str | None = None
+    variant_label: str | None = None
 
     @classmethod
     def from_row(cls, row) -> "TaskOut":

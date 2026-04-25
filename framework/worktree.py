@@ -211,6 +211,21 @@ def merge_into_base(
             )
 
 
+def delete_branch(target_repo: str | Path, branch: str) -> None:
+    """Force-delete ``branch`` in ``target_repo``. Best-effort — never
+    raises. Used to clean up per-task candidate branches after promote
+    or abandon, so the user's `git branch -a` doesn't accumulate cruft.
+    """
+    proc = _git(
+        ["branch", "-D", branch], cwd=Path(target_repo), check=False,
+    )
+    if proc.returncode != 0:
+        import logging
+        logging.getLogger(__name__).debug(
+            "branch delete %s: %s", branch, proc.stderr.strip(),
+        )
+
+
 def remove_worktree(target_repo: str | Path, worktree_path: str | Path) -> None:
     """Tear down a worktree. Best-effort — never raises.
 

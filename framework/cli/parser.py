@@ -92,6 +92,54 @@ def build_parser() -> argparse.ArgumentParser:
         _kind="cli",
         func=lambda ctx, a: C.cmd_plan_edit(ctx, a.task_id, a.field, a.value),
     )
+    p_plan_cands = plan_sub.add_parser(
+        "candidates",
+        help="spawn a candidate set from a YAML spec. Inserts a phantom "
+             "parent (c_<id>) plus one task per variant; all children "
+             "land in before_gate. v3 — see candidate {review,promote,abandon}.",
+    )
+    p_plan_cands.add_argument("yaml_file")
+    p_plan_cands.set_defaults(
+        _kind="cli",
+        func=lambda ctx, a: C.cmd_plan_candidates(ctx, a.yaml_file),
+    )
+
+    # ---- candidate sets (v3) ----------------------------------------
+    p_cand = sub.add_parser(
+        "candidate",
+        help="candidate-set lifecycle: review siblings, promote one, or "
+             "abandon the whole set",
+    )
+    cand_sub = p_cand.add_subparsers(dest="candidate_action", required=True)
+    p_cand_rev = cand_sub.add_parser(
+        "review", help="surface all candidates in a set side-by-side",
+    )
+    p_cand_rev.add_argument("set_id")
+    p_cand_rev.set_defaults(
+        _kind="cli",
+        func=lambda ctx, a: C.cmd_candidate_review(ctx, a.set_id),
+    )
+    p_cand_pro = cand_sub.add_parser(
+        "promote",
+        help="merge winner's branch into base; mark losers abandoned",
+    )
+    p_cand_pro.add_argument("set_id")
+    p_cand_pro.add_argument("winner_task_id")
+    p_cand_pro.set_defaults(
+        _kind="cli",
+        func=lambda ctx, a: C.cmd_candidate_promote(
+            ctx, a.set_id, a.winner_task_id,
+        ),
+    )
+    p_cand_aban = cand_sub.add_parser(
+        "abandon", help="drop the whole set without promoting any candidate",
+    )
+    p_cand_aban.add_argument("set_id")
+    p_cand_aban.add_argument("--reason", required=True)
+    p_cand_aban.set_defaults(
+        _kind="cli",
+        func=lambda ctx, a: C.cmd_candidate_abandon(ctx, a.set_id, a.reason),
+    )
 
     # ---- gates ------------------------------------------------------
     p_gate = sub.add_parser("gate", help="gate transitions")

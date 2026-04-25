@@ -50,6 +50,8 @@ def init_db(db_path: str | Path) -> None:
         _migrate_add_column(conn, "tasks", "archived_at", "TEXT")
         # v2 migration — git worktree path for development tasks.
         _migrate_add_column(conn, "tasks", "worktree_path", "TEXT")
+        # v3 migration — candidate variant label.
+        _migrate_add_column(conn, "tasks", "variant_label", "TEXT")
         conn.commit()
     finally:
         conn.close()

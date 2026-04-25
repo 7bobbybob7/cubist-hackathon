@@ -190,6 +190,43 @@ class BackendClient:
         r.raise_for_status()
         return r.json()
 
+    # --- candidate sets (v3) ------------------------------------------
+
+    def create_candidate_set(
+        self, *, goal_text: str, variants: list[dict[str, Any]],
+        shared_role: str = "development",
+    ) -> dict[str, Any]:
+        r = self._http.post(
+            "/candidate-sets",
+            json={"goal_text": goal_text, "variants": variants,
+                  "shared_role": shared_role},
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def get_candidate_set(self, set_id: str) -> dict[str, Any]:
+        r = self._http.get(f"/candidate-sets/{set_id}")
+        r.raise_for_status()
+        return r.json()
+
+    def candidate_promote(
+        self, set_id: str, winner_task_id: str,
+    ) -> dict[str, Any]:
+        r = self._http.post(
+            f"/candidate-sets/{set_id}/promote/{winner_task_id}",
+        )
+        r.raise_for_status()
+        return r.json()
+
+    def candidate_abandon(
+        self, set_id: str, reason: str = "abandoned by user",
+    ) -> dict[str, Any]:
+        r = self._http.post(
+            f"/candidate-sets/{set_id}/abandon", json={"reason": reason},
+        )
+        r.raise_for_status()
+        return r.json()
+
     def update_summary(self, content: str) -> dict[str, Any]:
         r = self._http.post("/summary", json={"content": content})
         r.raise_for_status()

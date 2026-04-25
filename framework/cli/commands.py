@@ -218,6 +218,130 @@ def cmd_plan_edit(ctx: CliContext, task_id: str, field: str, value: str) -> int:
     return 0
 
 
+# ---------------- candidate sets (v3) -------------------------------
+
+def cmd_plan_candidates(ctx: CliContext, yaml_file: str | Path) -> int:
+    """Spawn a candidate set from a YAML spec.
+
+    Expected YAML shape::
+
+        goal: "<shared goal>"
+        shared_role: development            # optional, default 'development'
+        variants:
+          - variant_label: opus
+            recommended_model: claude-opus-4-7
+            output_artifact_types: [PatchSummary]
+          - variant_label: sonnet
+            recommended_model: claude-sonnet-4-6
+            output_artifact_types: [PatchSummary]
+          - variant_label: haiku-prompted
+            recommended_model: claude-haiku-4-5-20251001
+            goal_text: "<override prompt for this variant>"
+            output_artifact_types: [PatchSummary]
+
+    The framework inserts one phantom-parent row plus one task per
+    variant. All children land in `before_gate` for individual review
+    (typically batch-approved with `gate before approve t_a t_b ...`).
+    """
+    spec = yaml.safe_load(Path(yaml_file).read_text(encoding="utf-8"))
+    if not isinstance(spec, dict) or "goal" not in spec or "variants" not in spec:
+        raise ValueError(
+            "candidate-plan YAML needs 'goal' and 'variants' keys"
+        )
+    out = ctx.backend.create_candidate_set(
+        goal_text=spec["goal"],
+        variants=spec["variants"],
+        shared_role=spec.get("shared_role", "development"),
+    )
+    ctx.log_action("framework_plan_candidates",
+                   {"yaml_file": str(yaml_file),
+                    "set_id": out["set_id"],
+                    "count": len(out["task_ids"])})
+    _print_yaml(ctx, out)
+    return 0
+
+
+def cmd_candidate_review(ctx: CliContext, set_id: str) -> int:
+    """Surface a candidate set side-by-side: each child's status, model,
+    cost, duration, and PatchSummary rationale. Read-only — the parent
+    runs this once all candidates have landed at after_gate, then asks
+    the user which one to promote.
+    """
+    s = ctx.backend.get_candidate_set(set_id)
+    children = s["children"]
+
+    rows = []
+    for c in children:
+        ledger = ctx.backend.db_query(
+            "SELECT model, input_tokens, output_tokens, cost_usd, "
+            "duration_seconds FROM budget_ledger WHERE task_id = ? "
+            "ORDER BY id DESC LIMIT 1",
+            params=[c["task_id"]],
+        )["rows"]
+        stats = ledger[0] if ledger else None
+        # Best PatchSummary or TestResult artifact for surfacing.
+        arts = ctx.backend.list_artifacts(task_id=c["task_id"])
+        primary = next(
+            (a for a in arts
+             if a["artifact_type"] in ("PatchSummary", "TestResult",
+                                        "FailureReport")),
+            None,
+        )
+        rows.append({
+            "task_id": c["task_id"],
+            "variant_label": c.get("variant_label"),
+            "status": c["status"],
+            "model": stats["model"] if stats else c.get("recommended_model"),
+            "cost_usd": (round(stats["cost_usd"], 6)
+                         if stats else None),
+            "duration_seconds": (round(stats["duration_seconds"], 3)
+                                 if stats else None),
+            "input_tokens": stats["input_tokens"] if stats else None,
+            "output_tokens": stats["output_tokens"] if stats else None,
+            "artifact_type": primary["artifact_type"] if primary else None,
+            "rationale": (
+                primary["content"].get("rationale")
+                if primary and isinstance(primary.get("content"), dict)
+                else None
+            ),
+            "worktree_path": c.get("worktree_path"),
+        })
+    out = {
+        "set_id": s["set_id"],
+        "goal_text": s["goal_text"],
+        "archived_at": s.get("archived_at"),
+        "candidates": rows,
+        "next_step": (
+            f"Pick a winner with `framework candidate promote {s['set_id']} <task_id>`, "
+            f"or `framework candidate abandon {s['set_id']} --reason '...'`."
+        ),
+    }
+    ctx.log_action("framework_candidate_review", {"set_id": set_id,
+                                                  "count": len(rows)})
+    _print_yaml(ctx, out)
+    return 0
+
+
+def cmd_candidate_promote(
+    ctx: CliContext, set_id: str, winner_task_id: str,
+) -> int:
+    out = ctx.backend.candidate_promote(set_id, winner_task_id)
+    ctx.log_action("framework_candidate_promote",
+                   {"set_id": set_id, "winner": winner_task_id})
+    _print_yaml(ctx, out)
+    return 0
+
+
+def cmd_candidate_abandon(
+    ctx: CliContext, set_id: str, reason: str,
+) -> int:
+    out = ctx.backend.candidate_abandon(set_id, reason)
+    ctx.log_action("framework_candidate_abandon",
+                   {"set_id": set_id, "reason": reason})
+    _print_yaml(ctx, out)
+    return 0
+
+
 def cmd_gate_before_approve(
     ctx: CliContext, task_id: str | list[str],
 ) -> int:

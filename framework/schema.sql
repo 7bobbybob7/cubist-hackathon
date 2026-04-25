@@ -17,7 +17,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     status               TEXT NOT NULL
                          CHECK (status IN (
                              'created','before_gate','ready','claimed',
-                             'running','after_gate','done','rejected'
+                             'running','after_gate','done','rejected',
+                             'abandoned'
                          )),
     pod_id               TEXT,
     claimed_at           TEXT,
@@ -27,6 +28,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     retry_count          INTEGER NOT NULL DEFAULT 0,
     archived_at          TEXT,
     worktree_path        TEXT,
+    variant_label        TEXT,
     FOREIGN KEY (parent_task_id) REFERENCES tasks(task_id)
 );
 

@@ -53,6 +53,45 @@ You must:
 
 The summary update is non-optional. Skipping it is the failure mode that makes pods drift over a long run.
 
+## Candidate sets (v3 — opt-in)
+
+A **candidate set** is N tasks attempting the same logical goal with one varied dimension (model, prompt, etc.). The user opts in by running `framework plan candidates <yaml>`; the framework inserts a phantom-parent row whose `task_id` starts with **`c_`** and one task per variant. Children all run in parallel through the normal gate flow, all land at `after_gate`, and then the user picks ONE winner whose changes merge into base.
+
+**How to detect a candidate child at after-gate.** When you fetch a task at `after_gate`, check `parent_task_id`. If it starts with `c_`, the task is a candidate child — **do not** call `framework gate after approve` on it (the framework refuses with `IllegalTransition`). Instead:
+
+1. Wait until **all siblings** of the set have reached `after_gate` (or are `rejected`/`abandoned`). Group by `parent_task_id`. Run `framework db query "SELECT task_id, status FROM tasks WHERE parent_task_id = '<c_id>'"` to check.
+2. Run `framework candidate review <c_id>` to surface every candidate's task_id, variant_label, model, cost, duration, and PatchSummary rationale side-by-side.
+3. Show the side-by-side comparison to the user. Don't pre-pick a winner unless the user asks for a recommendation.
+4. On user's choice: run `framework candidate promote <c_id> <winner_task_id>`. The framework merges the winner's per-task branch into base (the merge that was suppressed at after-gate now happens), marks losers `abandoned`, and removes their worktrees + branches. Then update `rolling_summary.md` once for the whole set.
+5. On "none of these are good": run `framework candidate abandon <c_id> --reason "..."`. All children → `abandoned`, all worktrees + branches removed. Then surface the methodology agent for a re-plan.
+
+**How to spawn a candidate set.** When the user says "try this two ways" / "I'm not sure which approach is right" / "compare opus vs sonnet on this", write a YAML and call `framework plan candidates`:
+
+```yaml
+goal: "<shared goal text>"
+shared_role: development           # optional, default 'development'
+variants:
+  - variant_label: opus
+    recommended_model: claude-opus-4-7
+    output_artifact_types: [PatchSummary]
+    agent_role: development
+    goal_text: ""                   # empty → inherits the shared goal
+  - variant_label: sonnet-prompted
+    recommended_model: claude-sonnet-4-6
+    output_artifact_types: [PatchSummary]
+    agent_role: development
+    goal_text: "<override prompt to bias this candidate>"
+```
+
+The user still approves each child's before-gate (typically via the batch `framework gate before approve t_a t_b t_c` which collapses Python boot overhead so two pods can claim in the same poll window).
+
+**Hard rules for candidates:**
+
+- Never call `framework gate after approve` on a candidate child. The framework refuses, and trying it confuses the user.
+- Wait for all siblings before surfacing review — don't promote based on a partial set.
+- Update `rolling_summary.md` ONCE per set resolution (promote OR abandon), not once per child.
+- Cost-warn the user before spawning N candidates: each costs the full task budget. Three Opus candidates of a non-trivial task can hit dollars quickly.
+
 ## Tool reference
 
 | Tool | Use when |
@@ -70,6 +109,10 @@ The summary update is non-optional. Skipping it is the failure mode that makes p
 | `framework gate after reject <task_id> --reason "..."` | Reject artifact, task returns to `before_gate` |
 | `framework subagent invoke <role> <task-yaml>` | Synchronously run a subagent (planning) — Phase 4+ |
 | `framework summary update <file>` | Replace `rolling_summary.md` after an after-gate approval |
+| `framework plan candidates <yaml>` | Spawn a candidate set (N variants of one goal). v3 |
+| `framework candidate review <c_id>` | Surface all siblings in a set side-by-side |
+| `framework candidate promote <c_id> <winner_task_id>` | Merge winner's branch; abandon losers |
+| `framework candidate abandon <c_id> --reason "..."` | Drop the whole set, no merge |
 
 ## What NOT to do
 
