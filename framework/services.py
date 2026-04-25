@@ -26,6 +26,7 @@ from framework.models import (
     TaskCreate, TaskEdit, TaskOut,
 )
 from framework.scheduler import claim_next_task
+from framework.state import StatePaths
 
 _id_lock = threading.Lock()
 _task_counter = 0
@@ -309,8 +310,95 @@ def edit_task(
     return get_task(db, task_id)
 
 
+def _load_run_meta(state_paths: StatePaths) -> dict[str, Any] | None:
+    """Read run.yaml from a state-dir, or return None if missing/unreadable."""
+    rp = state_paths.run_yaml
+    if not rp.exists():
+        return None
+    try:
+        import yaml
+        return yaml.safe_load(rp.read_text(encoding="utf-8")) or {}
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "could not read run.yaml at %s", rp,
+        )
+        return None
+
+
+def _maybe_create_worktree_on_approve(
+    db: Database, events_jsonl: Path, state_paths: StatePaths, task: TaskOut,
+) -> None:
+    """v2: development tasks get a per-task git worktree on before-gate
+    approve so two pods can edit the same logical repo via separate
+    checkouts. Testing tasks that depend on a dev task with a worktree
+    are pointed at the same worktree (read-only by role contract).
+
+    No-op when:
+    - the task isn't development or testing
+    - run.yaml is missing or target isn't a git repo
+    - imports fail (worktree module deps)
+    """
+    if task.agent_role not in ("development", "testing"):
+        return
+    meta = _load_run_meta(state_paths)
+    if not meta or not meta.get("target_is_git"):
+        return
+    target_repo = meta.get("target_repo")
+    base_branch = meta.get("branch_name")
+    if not target_repo or not base_branch:
+        return
+
+    from framework.worktree import WorktreeError, create_worktree
+
+    if task.agent_role == "development":
+        try:
+            wt = create_worktree(
+                target_repo, base_branch, task.task_id,
+                state_paths.worktrees_dir,
+            )
+        except WorktreeError as e:
+            import logging
+            logging.getLogger(__name__).warning(
+                "worktree creation failed for %s: %s", task.task_id, e,
+            )
+            return
+        db.execute(
+            "UPDATE tasks SET working_dir = ?, worktree_path = ? "
+            "WHERE task_id = ?",
+            (str(wt), str(wt), task.task_id),
+        )
+        emit_event(
+            db, events_jsonl, "worktree_created",
+            task_id=task.task_id,
+            payload={"worktree_path": str(wt), "branch": f"{base_branch}-{task.task_id}"},
+        )
+        return
+
+    # task.agent_role == "testing": share an upstream dev task's worktree
+    # if any of its dependencies has one. Multiple readers on a single
+    # worktree are fine.
+    for dep_id in task.depends_on or []:
+        try:
+            dep = get_task(db, dep_id)
+        except TaskNotFound:
+            continue
+        if dep.worktree_path and dep.agent_role == "development":
+            db.execute(
+                "UPDATE tasks SET working_dir = ? WHERE task_id = ?",
+                (dep.worktree_path, task.task_id),
+            )
+            emit_event(
+                db, events_jsonl, "worktree_shared",
+                task_id=task.task_id,
+                payload={"shared_from": dep_id, "worktree_path": dep.worktree_path},
+            )
+            return
+
+
 def approve_before(
-    db: Database, events_jsonl: Path, task_id: str
+    db: Database, events_jsonl: Path, task_id: str,
+    *, state_paths: StatePaths | None = None,
 ) -> TaskOut:
     task = get_task(db, task_id)
     if task.status != "before_gate":
@@ -319,6 +407,10 @@ def approve_before(
         )
     db.execute("UPDATE tasks SET status = 'ready' WHERE task_id = ?", (task_id,))
     emit_event(db, events_jsonl, "task_approved_before", task_id=task_id)
+    if state_paths is not None:
+        _maybe_create_worktree_on_approve(
+            db, events_jsonl, state_paths, get_task(db, task_id),
+        )
     return get_task(db, task_id)
 
 
@@ -497,8 +589,84 @@ def submit_result(
     return get_task(db, task_id), artifacts_out
 
 
+def _maybe_cleanup_worktree(
+    db: Database, events_jsonl: Path, state_paths: StatePaths,
+    task: TaskOut, *, capture_diff: bool,
+) -> str | None:
+    """If the task owns a worktree (i.e. ``worktree_path`` and is a dev
+    task), tear it down. Optionally extract a diff first so the
+    PatchSummary can record what changed. Best-effort — the gate
+    transition has already happened by the time this runs.
+
+    Testing tasks that share a dev worktree don't own it: leave it alone.
+    """
+    if task.agent_role != "development":
+        return None
+    if not task.worktree_path:
+        return None
+    meta = _load_run_meta(state_paths)
+    if not meta:
+        return None
+    target_repo = meta.get("target_repo")
+    base_branch = meta.get("branch_name")
+    if not target_repo or not base_branch:
+        return None
+
+    diff_text: str | None = None
+    try:
+        from framework.worktree import extract_diff, remove_worktree
+        if capture_diff:
+            diff_text = extract_diff(task.worktree_path, base_branch) or None
+        remove_worktree(target_repo, task.worktree_path)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception(
+            "worktree cleanup failed for %s", task.task_id,
+        )
+        return diff_text
+
+    db.execute(
+        "UPDATE tasks SET worktree_path = NULL WHERE task_id = ?",
+        (task.task_id,),
+    )
+    emit_event(
+        db, events_jsonl, "worktree_removed",
+        task_id=task.task_id,
+        payload={"had_diff": bool(diff_text)},
+    )
+    return diff_text
+
+
+def _attach_diff_to_patch_summary(
+    db: Database, task_id: str, diff_text: str,
+) -> None:
+    """Append the worktree diff to the task's most recent PatchSummary
+    artifact's content. No-op if no PatchSummary exists.
+    """
+    row = db.query_one(
+        "SELECT artifact_id, content FROM artifacts "
+        "WHERE produced_by_task = ? AND artifact_type = 'PatchSummary' "
+        "ORDER BY produced_at DESC LIMIT 1",
+        (task_id,),
+    )
+    if row is None:
+        return
+    try:
+        content = json.loads(row["content"])
+    except (TypeError, json.JSONDecodeError):
+        return
+    if not isinstance(content, dict):
+        return
+    content["diff"] = diff_text
+    db.execute(
+        "UPDATE artifacts SET content = ? WHERE artifact_id = ?",
+        (json.dumps(content), row["artifact_id"]),
+    )
+
+
 def approve_after(
-    db: Database, events_jsonl: Path, task_id: str
+    db: Database, events_jsonl: Path, task_id: str,
+    *, state_paths: StatePaths | None = None,
 ) -> TaskOut:
     task = get_task(db, task_id)
     if task.status != "after_gate":
@@ -507,14 +675,26 @@ def approve_after(
         )
     db.execute("UPDATE tasks SET status = 'done' WHERE task_id = ?", (task_id,))
     emit_event(db, events_jsonl, "task_approved_after", task_id=task_id)
+    if state_paths is not None:
+        diff = _maybe_cleanup_worktree(
+            db, events_jsonl, state_paths, task, capture_diff=True,
+        )
+        if diff:
+            _attach_diff_to_patch_summary(db, task_id, diff)
     return get_task(db, task_id)
 
 
 def reject_after(
-    db: Database, events_jsonl: Path, task_id: str, reason: str
+    db: Database, events_jsonl: Path, task_id: str, reason: str,
+    *, state_paths: StatePaths | None = None,
 ) -> TaskOut:
     """Reject artifact at the after gate; task returns to ``before_gate``
     so the user can edit the spec and retry. ``retry_count`` is incremented.
+
+    The worktree is torn down — the next approve gets a fresh one. Any
+    diff in the rejected worktree is lost (the user already saw the
+    artifact and decided it was wrong; preserving the diff would just
+    leak stale state into the retry).
     """
     task = get_task(db, task_id)
     if task.status != "after_gate":
@@ -533,6 +713,10 @@ def reject_after(
         task_id=task_id, payload={"reason": reason},
     )
     emit_event(db, events_jsonl, "task_before_gate", task_id=task_id)
+    if state_paths is not None:
+        _maybe_cleanup_worktree(
+            db, events_jsonl, state_paths, task, capture_diff=False,
+        )
     return get_task(db, task_id)
 
 

@@ -55,6 +55,15 @@ class StatePaths:
     def plan_dir(self) -> Path:
         return self.root / "plan"
 
+    @property
+    def worktrees_dir(self) -> Path:
+        """Per-task git worktrees live here (v2). One subdir per task_id."""
+        return self.root / "worktrees"
+
+    @property
+    def run_yaml(self) -> Path:
+        return self.root / "run.yaml"
+
     def ensure(self) -> None:
         """Create the minimum directory layout needed by Phase 1."""
         self.root.mkdir(parents=True, exist_ok=True)

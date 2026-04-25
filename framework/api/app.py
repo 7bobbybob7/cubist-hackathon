@@ -118,7 +118,9 @@ def create_app(state_dir: str | Path) -> FastAPI:
         db: Database = Depends(get_db),
         paths: StatePaths = Depends(get_paths),
     ):
-        return svc.approve_before(db, paths.events_jsonl, task_id)
+        return svc.approve_before(
+            db, paths.events_jsonl, task_id, state_paths=paths,
+        )
 
     @app.post("/tasks/{task_id}/gate/before/reject", response_model=TaskOut)
     def gate_before_reject(
@@ -135,7 +137,9 @@ def create_app(state_dir: str | Path) -> FastAPI:
         db: Database = Depends(get_db),
         paths: StatePaths = Depends(get_paths),
     ):
-        return svc.approve_after(db, paths.events_jsonl, task_id)
+        return svc.approve_after(
+            db, paths.events_jsonl, task_id, state_paths=paths,
+        )
 
     @app.post("/tasks/{task_id}/gate/after/reject", response_model=TaskOut)
     def gate_after_reject(
@@ -144,7 +148,9 @@ def create_app(state_dir: str | Path) -> FastAPI:
         db: Database = Depends(get_db),
         paths: StatePaths = Depends(get_paths),
     ):
-        return svc.reject_after(db, paths.events_jsonl, task_id, body.reason)
+        return svc.reject_after(
+            db, paths.events_jsonl, task_id, body.reason, state_paths=paths,
+        )
 
     # ---------------- Pod operations --------------------------------
 

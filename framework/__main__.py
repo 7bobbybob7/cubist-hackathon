@@ -19,6 +19,19 @@ def _default_backend_url() -> str:
     return os.environ.get("FRAMEWORK_BACKEND_URL", "http://127.0.0.1:8765")
 
 
+def _pod_api_key_env(pod_id: str) -> str:
+    """Convention: ``ANTHROPIC_API_KEY_POD_<ID>`` per pod.
+
+    ``pod_a`` → ``ANTHROPIC_API_KEY_POD_A``, ``pod_b`` →
+    ``ANTHROPIC_API_KEY_POD_B``, etc. Each pod gets its own key so
+    runaway spend can be traced (and rate-limited) per pod.
+    """
+    suffix = pod_id.upper()
+    if suffix.startswith("POD_"):
+        suffix = suffix[len("POD_"):]
+    return f"ANTHROPIC_API_KEY_POD_{suffix}"
+
+
 def _run_admin(args) -> int:
     state_dir = args.state_dir or _default_state_dir()
     if args._name == "backend":
@@ -37,11 +50,12 @@ def _run_admin(args) -> int:
         return 0
     if args._name == "start-pod":
         from framework.pod.__main__ import main as pod_main
+        api_key_env = args.api_key_env or _pod_api_key_env(args.pod_id)
         return pod_main([
             args.pod_id,
             "--state-dir", state_dir,
             "--backend-url", args.backend_url or _default_backend_url(),
-            "--api-key-env", args.api_key_env,
+            "--api-key-env", api_key_env,
         ])
     raise SystemExit(f"unknown admin command: {args._name}")
 

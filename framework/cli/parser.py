@@ -33,7 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_pod = sub.add_parser("start-pod", help="run a pod worker")
     p_pod.add_argument("pod_id")
-    p_pod.add_argument("--api-key-env", default="ANTHROPIC_API_KEY_POD_A")
+    p_pod.add_argument(
+        "--api-key-env", default=None,
+        help="env var name holding the pod's Anthropic API key. "
+             "Defaults to ANTHROPIC_API_KEY_POD_<ID> (e.g. pod_b → "
+             "ANTHROPIC_API_KEY_POD_B), with fallback to ANTHROPIC_API_KEY.",
+    )
     p_pod.set_defaults(_kind="admin", _name="start-pod")
 
     # ---- inspection -------------------------------------------------

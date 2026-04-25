@@ -48,6 +48,8 @@ def init_db(db_path: str | Path) -> None:
         # Phase 6 migration — safe on fresh DBs (column already exists)
         # and safe on pre-Phase-6 DBs (column gets added).
         _migrate_add_column(conn, "tasks", "archived_at", "TEXT")
+        # v2 migration — git worktree path for development tasks.
+        _migrate_add_column(conn, "tasks", "worktree_path", "TEXT")
         conn.commit()
     finally:
         conn.close()

@@ -1,7 +1,8 @@
 """Phase 3: framework run start bootstrap."""
-import yaml
+import subprocess
 
 import pytest
+import yaml
 
 from framework.bootstrap import bootstrap_run
 from framework.state import StatePaths
@@ -71,3 +72,45 @@ def test_bootstrap_overwrite_wipes_old(tmp_path):
 def test_bootstrap_validates_target_repo(tmp_path):
     with pytest.raises(FileNotFoundError):
         bootstrap_run(tmp_path / "fw", goal="g", target_repo=str(tmp_path / "nope"))
+
+
+def test_bootstrap_creates_framework_branch_in_git_target(tmp_path):
+    """v2: when the target is a git repo, bootstrap creates the
+    framework/<run-id> branch so per-task worktrees can fork from it."""
+    target = tmp_path / "git-repo"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=target, check=True)
+    (target / "README.md").write_text("hi\n")
+    subprocess.run(["git", "add", "."], cwd=target, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=target, check=True)
+
+    state = tmp_path / "fw"
+    info = bootstrap_run(state, goal="g", target_repo=str(target))
+    assert info["branch_name"].startswith("framework/")
+
+    branch = info["branch_name"]
+    proc = subprocess.run(
+        ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
+        cwd=target, capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, (
+        f"branch {branch!r} should exist after bootstrap; "
+        f"git said: {proc.stderr}"
+    )
+
+    run = yaml.safe_load((state / "run.yaml").read_text())
+    assert run["target_is_git"] is True
+
+
+def test_bootstrap_tolerates_non_git_target(tmp_path):
+    """A plain directory still bootstraps fine — pods just won't get
+    worktree isolation."""
+    target = tmp_path / "plain"
+    target.mkdir()
+    state = tmp_path / "fw"
+    bootstrap_run(state, goal="g", target_repo=str(target))
+    run = yaml.safe_load((state / "run.yaml").read_text())
+    # Plain dir → target_is_git: False, no branch created.
+    assert run["target_is_git"] is False

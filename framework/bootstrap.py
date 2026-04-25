@@ -17,6 +17,7 @@ import yaml
 from framework.config import write_default_config
 from framework.db import init_db
 from framework.state import StatePaths
+from framework.worktree import WorktreeError, ensure_branch, is_git_repo
 
 
 def _new_run_id() -> str:
@@ -86,13 +87,35 @@ def bootstrap_run(
     )
     paths.rolling_summary.write_text(summary, encoding="utf-8")
 
+    branch_name = f"framework/{run_id}"
+
+    # Per-task worktrees (v2) need a real branch in the target repo to
+    # fork from. Create it now if the target is a git repo. Non-git
+    # targets are still allowed — pods will just edit files directly,
+    # without worktree isolation. (Methodology agent decides.)
+    target_is_git = is_git_repo(target)
+    if target_is_git:
+        try:
+            ensure_branch(target, branch_name)
+        except WorktreeError as e:
+            # Don't abort bootstrap on a git failure — surface the issue
+            # and let the user retry with --overwrite or a clean repo.
+            # Pods that try to use worktrees will fail with a clear
+            # error at approve_before time.
+            raise WorktreeError(
+                f"failed to create framework branch in {target}: {e}\n"
+                "Either commit/stash uncommitted state, switch to a "
+                "clean HEAD, or pass a different target_repo."
+            ) from e
+
     # Write a run-meta YAML so the parent can read goal + target_repo +
     # run_id without parsing config.yaml or guessing.
     meta = {
         "run_id": run_id,
         "goal": goal,
         "target_repo": str(target),
-        "branch_name": f"framework/{run_id}",
+        "branch_name": branch_name,
+        "target_is_git": target_is_git,
         "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
     (paths.root / "run.yaml").write_text(

@@ -68,6 +68,7 @@ class TaskOut(BaseModel):
     rejection_reason: str | None
     retry_count: int
     archived_at: str | None = None
+    worktree_path: str | None = None
 
     @classmethod
     def from_row(cls, row) -> "TaskOut":

@@ -31,6 +31,10 @@ EVENT_TYPES = frozenset({
     "plan_revised",
     "pod_registered",
     "pod_heartbeat",
+    # v2 — git worktree lifecycle
+    "worktree_created",
+    "worktree_shared",
+    "worktree_removed",
 })
 
 _jsonl_lock = threading.Lock()

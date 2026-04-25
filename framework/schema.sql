@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     rejection_reason     TEXT,
     retry_count          INTEGER NOT NULL DEFAULT 0,
     archived_at          TEXT,
+    worktree_path        TEXT,
     FOREIGN KEY (parent_task_id) REFERENCES tasks(task_id)
 );
 
